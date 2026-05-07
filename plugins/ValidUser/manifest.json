@@ -1,0 +1,12 @@
+{
+  "name": "ValidUserFix",
+  "description": "Fixes invalid or uncached user mentions by resolving user IDs so they become clickable again.",
+  "authors": [
+    {
+      "name": "fshin",
+      "id": "1381008677301129257"
+    }
+  ],
+  "main": "./src/index.ts",
+  "version": "1.0.0"
+}
