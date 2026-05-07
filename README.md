@@ -16,11 +16,10 @@ It detects invalid mention formats (like raw user IDs or “unknown” mentions)
 ---
 
 ## 📁 Structure
-FixInvalidMentions/
+ValidUser/
 ├── manifest.json
 └── src/
     ├── index.ts
-    └── mentionFixer.ts
     ---
 
 ## ⚙️ How it works
