@@ -1,0 +1,15 @@
+{
+  "name": "FixInvalidMentions",
+  "description": "Fixes broken or uncached user mentions by resolving user IDs and improving how they are displayed in chat.",
+  "authors": [
+    {
+      "name": "fshin",
+      "id": "1381008677301129257"
+    }
+  ],
+  "main": "src/index.ts",
+  "version": "1.0.0",
+  "vendetta": {
+    "icon": "ic_person_24px"
+  }
+}
