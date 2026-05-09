@@ -1,184 +1,138 @@
-import { findByProps } from "@revenge-mod/metro";
-import { before } from "@vendetta/patcher";
-import { logger } from "@vendetta";
+import { findByProps, findByName } from "@metro/utils";
+import { FluxDispatcher } from "@metro/common";
+import { before } from "@lib/patcher";
+import { Plugin } from "@lib/plugins";
 
-const FluxDispatcher = findByProps("dispatch", "subscribe");
-const UserFetcher = findByProps("fetchProfile", "fetchUser");
-const UserStore = findByProps("getUser", "getUsers");
-const UserCache = findByProps("USER_CACHE"); // For direct cache access
+const UserStore = findByProps("getUser", "getCurrentUser");
+const RestAPI = findByProps("getAPIBaseURL", "get", "post") ?? findByProps("makeRequest", "get");
+const UserProfileActions = findByProps("fetchProfile", "getProfileFetching");
 
+const MENTION_RE = /<@!?(\d{17,20})>/g;
+const fetched = new Set<string>();
 const pending = new Set<string>();
-const resolveQueue = new Map<string, number>(); // Track resolve attempts with timestamp
 
-// Config to prevent spam
-const THROTTLE_MS = 5000; // Wait 5s before retrying same user
-const MAX_RETRIES = 3; // Max attempts per user per session
-
-async function injectUserIntoCache(id: string, userData?: any) {
-    try {
-        // Dispatch USER_UPDATE to inject into Discord's cache
-        FluxDispatcher?.dispatch?.({
-            type: "USER_UPDATE",
-            user: userData || { id, username: `Unknown#${id.slice(0, 4)}` }
-        });
-
-        // Also dispatch to different event types Discord might listen to
-        FluxDispatcher?.dispatch?.({
-            type: "USER_PROFILE_FETCH_SUCCESS",
-            user: userData || { id }
-        });
-    } catch (e) {
-        logger.error("[ValidUserFix] Cache injection failed:", e);
+function extractMentionedIds(content: string): string[] {
+    const ids: string[] = [];
+    let match: RegExpExecArray | null;
+    MENTION_RE.lastIndex = 0;
+    while ((match = MENTION_RE.exec(content)) !== null) {
+        ids.push(match[1]);
     }
+    return ids;
 }
 
-async function resolveUser(id: string) {
-    if (!id || pending.has(id)) return;
-    
-    // Check if user already cached
-    if (UserStore?.getUser?.(id)) return;
+function isUserCached(id: string): boolean {
+    const user = UserStore?.getUser(id);
+    return !!(user && user.username);
+}
 
-    // Rate limiting: check if we've tried this user recently
-    const lastAttempt = resolveQueue.get(id) || 0;
-    const now = Date.now();
-    
-    if (now - lastAttempt < THROTTLE_MS) {
-        logger.debug(`[ValidUserFix] Throttling ${id}, last attempt ${now - lastAttempt}ms ago`);
-        return;
-    }
+const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
-    const attempts = (resolveQueue.get(`${id}_attempts`) || 0) as number;
-    if (attempts >= MAX_RETRIES) {
-        logger.warn(`[ValidUserFix] Max retries reached for ${id}`);
-        return;
-    }
+async function resolveUser(id: string): Promise<void> {
+    if (fetched.has(id) || pending.has(id)) return;
+    if (isUserCached(id)) { fetched.add(id); return; }
 
     pending.add(id);
-    resolveQueue.set(id, now);
-    resolveQueue.set(`${id}_attempts`, attempts + 1);
-
     try {
-        // PRIORITY 1: Use internal profile fetch (internal to Discord)
-        if (typeof UserFetcher?.fetchProfile === "function") {
-            logger.debug(`[ValidUserFix] Fetching profile for ${id}`);
-            await UserFetcher.fetchProfile(id);
-            
-            // After successful fetch, check if user is now in cache
-            setTimeout(() => {
-                const user = UserStore?.getUser?.(id);
-                if (user) {
-                    injectUserIntoCache(id, user);
-                    logger.debug(`[ValidUserFix] Successfully cached user ${id}`);
-                }
-            }, 500);
-            return;
-        }
-
-        // PRIORITY 2: Use fetchUser if fetchProfile isn't available
-        if (typeof UserFetcher?.fetchUser === "function") {
-            logger.debug(`[ValidUserFix] Fallback to fetchUser for ${id}`);
-            await UserFetcher.fetchUser(id);
-            return;
-        }
-
-        // PRIORITY 3: API fallback (only if needed)
-        logger.debug(`[ValidUserFix] Using API fallback for ${id}`);
-        const token = findByProps("getToken")?.getToken?.();
-        if (!token) {
-            logger.warn("[ValidUserFix] No token available for API call");
-            return;
-        }
-
-        const res = await fetch(
-            `https://discord.com/api/v9/users/${id}/profile`,
-            {
-                headers: { Authorization: token }
+        if (UserProfileActions?.fetchProfile) {
+            await UserProfileActions.fetchProfile(id);
+        } else {
+            const res = await RestAPI.get({ url: `/users/${id}` });
+            if (res?.body) {
+                FluxDispatcher.dispatch({ type: "USER_UPDATE", user: res.body });
             }
-        );
-
-        if (!res.ok) {
-            logger.warn(`[ValidUserFix] API returned ${res.status} for user ${id}`);
-            return;
         }
-
-        const data = await res.json();
-        injectUserIntoCache(id, data.user ?? data);
-        
+        fetched.add(id);
     } catch (e) {
-        logger.error("[ValidUserFix] resolve failed for " + id, e);
+        console.warn(`[ResolveMentions] Could not fetch user ${id}:`, e);
     } finally {
-        // Keep in pending set for 15s to avoid duplicate requests
-        setTimeout(() => pending.delete(id), 15000);
+        pending.delete(id);
     }
 }
 
-function extractIds(content: string) {
-    const matches = content.match(/<@!?(\d+)>/g);
-    return matches?.map(m => m.replace(/[<@!>]/g, "")) ?? [];
-}
-
-// Patch mention component to trigger resolve on click
-function patchMentionComponent() {
-    try {
-        const MentionComponent = findByProps("_parseUnknownMention");
-        
-        if (MentionComponent?._parseUnknownMention) {
-            const original = MentionComponent._parseUnknownMention;
-            
-            MentionComponent._parseUnknownMention = function(mention: any) {
-                const result = original.call(this, mention);
-                
-                // If mention is unknown, try to resolve it
-                if (mention?.userId) {
-                    resolveUser(mention.userId);
-                }
-                
-                return result;
-            };
-        }
-    } catch (e) {
-        logger.warn("[ValidUserFix] Failed to patch mention component:", e);
+async function resolveUnknownMentions(ids: string[]): Promise<void> {
+    const unknown = ids.filter(id => !isUserCached(id) && !fetched.has(id) && !pending.has(id));
+    for (let i = 0; i < unknown.length; i++) {
+        if (i > 0) await delay(150);
+        resolveUser(unknown[i]);
     }
 }
 
 export default {
-    onLoad() {
-        const Dispatcher = findByProps("dispatch", "subscribe");
-        if (!Dispatcher) {
-            logger.error("[ValidUserFix] Dispatcher not found");
-            return;
-        }
+    patches: [] as any[],
+    _unpatchers: [] as (() => void)[],
 
-        const handler = (event: any) => {
-            const msg = event?.message;
-            const messages = event?.messages ?? (msg ? [msg] : []);
-
-            for (const m of messages) {
-                const content = m?.content;
-                if (typeof content !== "string") continue;
-
-                const ids = extractIds(content);
-                for (const id of ids) {
-                    logger.debug(`[ValidUserFix] Found mention: ${id}`);
-                    resolveUser(id);
-                }
+    start() {
+        this._onMessage = (payload: any) => {
+            try {
+                const content: string = payload?.message?.content ?? "";
+                const fromArray: string[] = payload?.message?.mentions?.map((u: any) => u.id) ?? [];
+                const fromContent = extractMentionedIds(content);
+                const allIds = [...new Set([...fromArray, ...fromContent])];
+                if (allIds.length > 0) resolveUnknownMentions(allIds);
+            } catch (e) {
+                console.warn("[ResolveMentions] MESSAGE_CREATE handler error:", e);
             }
         };
 
-        // Subscribe to message events
-        Dispatcher.subscribe("MESSAGE_CREATE", handler);
-        Dispatcher.subscribe("LOAD_MESSAGES_SUCCESS", handler);
-        Dispatcher.subscribe("MESSAGE_UPDATE", handler);
+        this._onLoadMessages = (payload: any) => {
+            try {
+                const messages: any[] = payload?.messages ?? [];
+                const ids = new Set<string>();
+                for (const msg of messages) {
+                    (msg.mentions ?? []).forEach((u: any) => ids.add(u.id));
+                    extractMentionedIds(msg.content ?? "").forEach(id => ids.add(id));
+                }
+                if (ids.size > 0) resolveUnknownMentions([...ids]);
+            } catch (e) {
+                console.warn("[ResolveMentions] LOAD_MESSAGES_SUCCESS handler error:", e);
+            }
+        };
 
-        // Attempt to patch mention component for click handling
-        patchMentionComponent();
-
-        logger.info("[ValidUserFix] loaded with smart cache injection + throttling");
+        FluxDispatcher.subscribe("MESSAGE_CREATE", this._onMessage);
+        FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", this._onLoadMessages);
+        this._patchMentionPress();
     },
 
-    onUnload() {
+    _patchMentionPress() {
+        const candidates = [
+            findByName("UserMention", { default: true }),
+            findByProps("handleUserMentionPress"),
+            findByProps("onUserMentionPress"),
+        ].filter(Boolean);
+
+        for (const mod of candidates) {
+            const target = mod.default ?? mod;
+            const key = typeof target === "function" ? null
+                      : (target.handleUserMentionPress ? "handleUserMentionPress"
+                       : target.onUserMentionPress     ? "onUserMentionPress"
+                       : null);
+
+            if (!key && typeof target !== "function") continue;
+
+            try {
+                const unpatch = before(
+                    key ?? "__call__",
+                    key ? target : { __call__: target },
+                    (args: any[]) => {
+                        const id = typeof args[0] === "string" ? args[0]
+                                 : args[0]?.userId ?? args[0]?.id;
+                        if (id && !isUserCached(id)) resolveUser(id);
+                    }
+                );
+                this._unpatchers.push(unpatch);
+            } catch (e) {
+                console.warn("[ResolveMentions] Could not patch mention press:", e);
+            }
+        }
+    },
+
+    stop() {
+        FluxDispatcher.unsubscribe("MESSAGE_CREATE", this._onMessage);
+        FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", this._onLoadMessages);
+        this._unpatchers.forEach(u => u?.());
+        this._unpatchers = [];
+        fetched.clear();
         pending.clear();
-        resolveQueue.clear();
-        logger.info("[ValidUserFix] unloaded");
-    }
-};
+    },
+} satisfies Plugin;
